@@ -1,0 +1,48 @@
+name: Compilar SAMP iOS
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    
+    steps:
+    - name: Baixar código
+      uses: actions/checkout@v3
+    
+    - name: Configurar Xcode
+      uses: maxim-lobanov/setup-xcode@v1
+      with:
+        xcode-version: latest-stable
+    
+    - name: Compilar dylib
+      run: |
+        clang++ \
+          -arch arm64 \
+          -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
+          -mios-version-min=13.0 \
+          -dynamiclib \
+          -framework UIKit \
+          -framework Foundation \
+          -framework CoreGraphics \
+          -I./include \
+          -o samp_ios.dylib \
+          src/main.mm \
+          src/menu.mm \
+          src/network.mm \
+          src/hud.mm \
+          -fobjc-arc \
+          -std=c++17
+        
+        echo "✅ Compilado com sucesso!"
+        ls -la samp_ios.dylib
+    
+    - name: Salvar dylib como artefato
+      uses: actions/upload-artifact@v3
+      with:
+        name: samp_ios_dylib
+        path: samp_ios.dylib
