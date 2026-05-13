@@ -42,7 +42,7 @@ jobs:
         ls -la samp_ios.dylib
     
     - name: Salvar dylib como artefato
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: samp_ios_dylib
         path: samp_ios.dylib
