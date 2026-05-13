@@ -12,7 +12,7 @@ jobs:
     
     steps:
     - name: Baixar código
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
     
     - name: Configurar Xcode
       uses: maxim-lobanov/setup-xcode@v1
@@ -38,7 +38,7 @@ jobs:
           -fobjc-arc \
           -std=c++17
         
-        echo "✅ Compilado com sucesso!"
+        echo "Compilado!"
         ls -la samp_ios.dylib
     
     - name: Salvar dylib como artefato
