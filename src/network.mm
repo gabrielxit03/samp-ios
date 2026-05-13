@@ -2,262 +2,219 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <unistd.h>
 #include "../include/samp.h"
 
-// Opcodes do protocolo SA-MP 0.3.7
-#define PACKET_CONNECT          0x06
-#define PACKET_DISCONNECT       0x59
-#define PACKET_PLAYER_SYNC      0xA9
-#define PACKET_BULLET_SYNC      0xA1
-#define PACKET_VEHICLE_SYNC     0x8C
-#define PACKET_CHAT_MESSAGE     0x62
-#define PACKET_SPAWN            0x34
-
 @interface SAMPNetwork ()
-@property (nonatomic) int socket;
+@property (nonatomic) int sock;
 @property (nonatomic) BOOL conectado;
 @property (nonatomic, strong) NSString *ipAtual;
 @property (nonatomic) int portaAtual;
 @property (nonatomic, strong) NSString *nomeAtual;
 @property (nonatomic, strong) dispatch_queue_t filaRede;
-@property (nonatomic) struct sockaddr_in enderecoServidor;
+@property (nonatomic) struct sockaddr_in endServidor;
+@property (nonatomic) BOOL rodando;
 @end
 
 @implementation SAMPNetwork
 
 + (instancetype)shared {
-    static SAMPNetwork *instancia = nil;
-    static dispatch_once_t token;
-    dispatch_once(&token, ^{
-        instancia = [[SAMPNetwork alloc] init];
-    });
-    return instancia;
+    static SAMPNetwork *i = nil;
+    static dispatch_once_t t;
+    dispatch_once(&t, ^{ i = [[SAMPNetwork alloc] init]; });
+    return i;
 }
 
 - (instancetype)init {
     self = [super init];
     if (self) {
-        self.socket = -1;
+        self.sock = -1;
         self.conectado = NO;
-        self.filaRede = dispatch_queue_create(
-            "com.sampios.network", 
-            DISPATCH_QUEUE_SERIAL
-        );
+        self.rodando = NO;
+        self.filaRede = dispatch_queue_create("samp.network", DISPATCH_QUEUE_SERIAL);
     }
     return self;
 }
 
-// Conectar ao servidor SA-MP
+// Resolver hostname para IP
+- (NSString*)resolverIP:(NSString*)host {
+    struct hostent *he = gethostbyname([host UTF8String]);
+    if (!he) return host;
+    struct in_addr addr;
+    memcpy(&addr, he->h_addr_list[0], sizeof(struct in_addr));
+    return [NSString stringWithUTF8String:inet_ntoa(addr)];
+}
+
 - (void)conectar:(NSString*)ip porta:(int)porta nome:(NSString*)nome {
-    self.ipAtual = ip;
+    // Desconectar se já conectado
+    if (self.rodando) [self desconectar];
+
+    self.ipAtual   = ip;
     self.portaAtual = porta;
-    self.nomeAtual = nome;
-    
+    self.nomeAtual  = nome;
+    self.rodando    = YES;
+
     dispatch_async(self.filaRede, ^{
+        // Resolver hostname
+        NSString *ipResolvido = [self resolverIP:ip];
+        NSLog(@"[SAMP] Conectando em %@ (%@):%d como %@", ip, ipResolvido, porta, nome);
+
         // Criar socket UDP
-        self.socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-        if (self.socket < 0) {
-            NSLog(@"[SAMP-iOS] Erro ao criar socket!");
+        self.sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (self.sock < 0) {
+            [self notificar:@"Erro ao criar socket!" cor:0xFF0000FF];
             return;
         }
-        
-        // Configurar endereço do servidor
-        memset(&self->_enderecoServidor, 0, sizeof(self->_enderecoServidor));
-        self->_enderecoServidor.sin_family = AF_INET;
-        self->_enderecoServidor.sin_port = htons(porta);
-        inet_pton(AF_INET, [ip UTF8String], &self->_enderecoServidor.sin_addr);
-        
-        // Timeout de 5 segundos
-        struct timeval timeout;
-        timeout.tv_sec = 5;
-        timeout.tv_usec = 0;
-        setsockopt(self.socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-        
-        NSLog(@"[SAMP-iOS] Conectando em %@:%d...", ip, porta);
-        
-        // Enviar pacote de conexão SA-MP
-        [self enviarPacoteConexao];
-        
-        // Iniciar loop de recebimento
-        [self iniciarRecepcao];
+
+        // Configurar endereço
+        memset(&self->_endServidor, 0, sizeof(self->_endServidor));
+        self->_endServidor.sin_family = AF_INET;
+        self->_endServidor.sin_port   = htons(porta);
+        inet_pton(AF_INET, [ipResolvido UTF8String], &self->_endServidor.sin_addr);
+
+        // Timeout de recebimento
+        struct timeval tv = {5, 0};
+        setsockopt(self.sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+        // Tentar conectar 3 vezes
+        for (int tentativa = 0; tentativa < 3; tentativa++) {
+            NSLog(@"[SAMP] Tentativa %d...", tentativa+1);
+            [self enviarPacoteConexao];
+
+            // Aguardar resposta
+            uint8_t buf[4096];
+            struct sockaddr_in remetente;
+            socklen_t tamRem = sizeof(remetente);
+            ssize_t bytes = recvfrom(self.sock, buf, sizeof(buf), 0,
+                                     (struct sockaddr*)&remetente, &tamRem);
+            if (bytes > 0) {
+                [self processarPacote:buf tamanho:bytes];
+                // Iniciar loop de recebimento contínuo
+                [self loopRecepcao];
+                return;
+            }
+        }
+
+        // Falhou
+        [self notificar:@"Servidor não respondeu! Verifique o IP." cor:0xFF4400FF];
+        self.rodando = NO;
+        close(self.sock);
+        self.sock = -1;
     });
 }
 
-// Montar e enviar pacote de conexão SA-MP 0.3.7
 - (void)enviarPacoteConexao {
-    // Formato do pacote SA-MP:
-    // "SAMP" + IP(4 bytes) + Porta(2 bytes) + Opcode(1 byte) + Dados
-    
-    uint8_t pacote[256];
+    // Pacote SA-MP 0.3.7
+    // Formato: SAMP + IP(4) + Porta(2) + Opcode(1) + Versão(2) + Mod(1) + TamNome(1) + Nome + TamSenha(1)
+    uint8_t pkt[256];
     int pos = 0;
-    
-    // Header "SAMP"
-    pacote[pos++] = 'S';
-    pacote[pos++] = 'A';
-    pacote[pos++] = 'M';
-    pacote[pos++] = 'P';
-    
-    // IP do servidor (4 bytes)
-    uint32_t ip = self->_enderecoServidor.sin_addr.s_addr;
-    memcpy(&pacote[pos], &ip, 4);
-    pos += 4;
-    
-    // Porta (2 bytes)
+
+    // Header
+    pkt[pos++]='S'; pkt[pos++]='A'; pkt[pos++]='M'; pkt[pos++]='P';
+
+    // IP em bytes
+    uint32_t ip = self->_endServidor.sin_addr.s_addr;
+    memcpy(&pkt[pos], &ip, 4); pos += 4;
+
+    // Porta
     uint16_t porta = htons(self.portaAtual);
-    memcpy(&pacote[pos], &porta, 2);
-    pos += 2;
-    
-    // Opcode de conexão
-    pacote[pos++] = PACKET_CONNECT;
-    
-    // Versão do cliente SA-MP
-    uint16_t versao = 4057; // 0.3.7
-    memcpy(&pacote[pos], &versao, 2);
-    pos += 2;
-    
-    // Mod (0 = não mod, 1 = mod)
-    pacote[pos++] = 0;
-    
-    // Tamanho do nome
+    memcpy(&pkt[pos], &porta, 2); pos += 2;
+
+    // Opcode conexão = 'i'
+    pkt[pos++] = 'i';
+
+    // Versão SA-MP 0.3.7 = 4057
+    uint16_t versao = 4057;
+    memcpy(&pkt[pos], &versao, 2); pos += 2;
+
+    // Mod
+    pkt[pos++] = 0;
+
+    // Nome
     const char *nome = [self.nomeAtual UTF8String];
-    uint8_t tamNome = strlen(nome);
-    pacote[pos++] = tamNome;
-    memcpy(&pacote[pos], nome, tamNome);
-    pos += tamNome;
-    
+    uint8_t tamNome = (uint8_t)MIN(strlen(nome), 24);
+    pkt[pos++] = tamNome;
+    memcpy(&pkt[pos], nome, tamNome); pos += tamNome;
+
     // Senha (vazia)
-    pacote[pos++] = 0;
-    
-    // Enviar
-    sendto(
-        self.socket, 
-        pacote, pos, 0,
-        (struct sockaddr*)&self->_enderecoServidor, 
-        sizeof(self->_enderecoServidor)
-    );
-    
-    NSLog(@"[SAMP-iOS] Pacote de conexão enviado!");
+    pkt[pos++] = 0;
+
+    sendto(self.sock, pkt, pos, 0,
+           (struct sockaddr*)&self->_endServidor,
+           sizeof(self->_endServidor));
 }
 
-// Loop de recebimento de pacotes
-- (void)iniciarRecepcao {
-    uint8_t buffer[4096];
-    struct sockaddr_in endRemetente;
-    socklen_t tamEndereco = sizeof(endRemetente);
-    
-    while (self.socket >= 0) {
-        ssize_t bytesRecebidos = recvfrom(
-            self.socket,
-            buffer, sizeof(buffer), 0,
-            (struct sockaddr*)&endRemetente,
-            &tamEndereco
-        );
-        
-        if (bytesRecebidos < 0) {
-            if (!self.conectado) {
-                NSLog(@"[SAMP-iOS] Timeout - servidor não respondeu");
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    [[SAMPHUD shared] adicionarMensagem:@"Servidor não respondeu!" 
-                                                    cor:0xFF0000FF];
-                });
-            }
-            continue;
-        }
-        
-        // Processar pacote recebido
-        [self processarPacote:buffer tamanho:bytesRecebidos];
+- (void)loopRecepcao {
+    uint8_t buf[4096];
+    struct sockaddr_in rem;
+    socklen_t tamRem = sizeof(rem);
+
+    while (self.rodando && self.sock >= 0) {
+        ssize_t bytes = recvfrom(self.sock, buf, sizeof(buf), 0,
+                                  (struct sockaddr*)&rem, &tamRem);
+        if (bytes > 0) [self processarPacote:buf tamanho:bytes];
     }
 }
 
-// Processar pacotes recebidos do servidor
-- (void)processarPacote:(uint8_t*)dados tamanho:(ssize_t)tamanho {
-    if (tamanho < 11) return;
-    
-    // Verificar header SA-MP
-    if (dados[0] != 'S' || dados[1] != 'A' || 
-        dados[2] != 'M' || dados[3] != 'P') return;
-    
-    uint8_t opcode = dados[10];
-    
+- (void)processarPacote:(uint8_t*)d tamanho:(ssize_t)tam {
+    if (tam < 11) return;
+    if (d[0]!='S'||d[1]!='A'||d[2]!='M'||d[3]!='P') return;
+
+    uint8_t opcode = d[10];
+    NSLog(@"[SAMP] Pacote recebido opcode: 0x%02X", opcode);
+
     switch (opcode) {
-        case PACKET_CONNECT:
-            NSLog(@"[SAMP-iOS] Conectado ao servidor!");
+        case 'i': // Resposta de conexão
+            NSLog(@"[SAMP] Conectado!");
             self.conectado = YES;
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [[SAMPHUD shared] adicionarMensagem:@"Conectado ao servidor!" 
-                                                cor:0x00FF00FF];
-            });
+            [self notificar:@"Conectado ao servidor!" cor:0x00FF00FF];
             break;
-            
-        case PACKET_DISCONNECT:
-            NSLog(@"[SAMP-iOS] Desconectado do servidor!");
+
+        case 'd': // Desconexão
             self.conectado = NO;
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [[SAMPHUD shared] adicionarMensagem:@"Desconectado!" 
-                                                cor:0xFF0000FF];
-            });
+            [self notificar:@"Desconectado do servidor!" cor:0xFF0000FF];
             break;
-            
-        case PACKET_CHAT_MESSAGE:
-            // Processar mensagem de chat
-            if (tamanho > 12) {
-                NSString *msg = [NSString stringWithUTF8String:(char*)&dados[11]];
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    [[SAMPHUD shared] adicionarMensagem:msg cor:0xFFFFFFFF];
-                });
-            }
-            break;
-            
+
         default:
             break;
     }
 }
 
-// Enviar mensagem de chat
-- (void)enviarChat:(NSString*)mensagem {
-    if (!self.conectado) return;
-    
-    uint8_t pacote[256];
+- (void)enviarChat:(NSString*)msg {
+    if (!self.conectado || self.sock < 0) return;
+    uint8_t pkt[256];
     int pos = 0;
-    
-    // Header SA-MP
-    pacote[pos++] = 'S';
-    pacote[pos++] = 'A';
-    pacote[pos++] = 'M';
-    pacote[pos++] = 'P';
-    
-    // IP e porta
-    uint32_t ip = self->_enderecoServidor.sin_addr.s_addr;
-    memcpy(&pacote[pos], &ip, 4); pos += 4;
+    pkt[pos++]='S'; pkt[pos++]='A'; pkt[pos++]='M'; pkt[pos++]='P';
+    uint32_t ip = self->_endServidor.sin_addr.s_addr;
+    memcpy(&pkt[pos], &ip, 4); pos += 4;
     uint16_t porta = htons(self.portaAtual);
-    memcpy(&pacote[pos], &porta, 2); pos += 2;
-    
-    // Opcode chat
-    pacote[pos++] = PACKET_CHAT_MESSAGE;
-    
-    // Mensagem
-    const char *texto = [mensagem UTF8String];
-    uint8_t tam = strlen(texto);
-    pacote[pos++] = tam;
-    memcpy(&pacote[pos], texto, tam);
-    pos += tam;
-    
-    sendto(self.socket, pacote, pos, 0,
-           (struct sockaddr*)&self->_enderecoServidor,
-           sizeof(self->_enderecoServidor));
+    memcpy(&pkt[pos], &porta, 2); pos += 2;
+    pkt[pos++] = 0x62; // chat
+    const char *txt = [msg UTF8String];
+    uint8_t tam = (uint8_t)MIN(strlen(txt), 143);
+    pkt[pos++] = tam;
+    memcpy(&pkt[pos], txt, tam); pos += tam;
+    sendto(self.sock, pkt, pos, 0,
+           (struct sockaddr*)&self->_endServidor,
+           sizeof(self->_endServidor));
+}
+
+- (void)notificar:(NSString*)msg cor:(uint32_t)cor {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [[SAMPHUD shared] adicionarMensagem:msg cor:cor];
+    });
 }
 
 - (void)desconectar {
+    self.rodando = NO;
     self.conectado = NO;
-    if (self.socket >= 0) {
-        close(self.socket);
-        self.socket = -1;
+    if (self.sock >= 0) {
+        close(self.sock);
+        self.sock = -1;
     }
 }
 
-- (BOOL)estaConectado {
-    return self.conectado;
-}
+- (BOOL)estaConectado { return self.conectado; }
 
 @end
